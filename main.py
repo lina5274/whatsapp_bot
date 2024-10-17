@@ -159,6 +159,7 @@ def execute_query(query, params=None, return_data=True):
             if return_data:
                 return cur.fetchall()
 
+
 async def save_message(user_id, message_role, message_content):
     query = """
     INSERT INTO chat_history (user_id, message_role, message_content)
@@ -211,6 +212,7 @@ async def save_ai_response(user_id, ai_response):
     except Exception as e:
         logging.error(f"Ошибка при сохранении ответа AI для пользователя {user_id}: {str(e)}")
         raise
+
 
 def check_user_exists(whatsapp_id):
     query = """
