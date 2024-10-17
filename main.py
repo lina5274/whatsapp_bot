@@ -28,7 +28,7 @@ app = Flask(__name__)
 
 client = Client(os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN'))
 
-# Global ClientSession object
+# Глобальный объект ClientSession
 global_session = None
 
 
