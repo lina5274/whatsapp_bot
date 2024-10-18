@@ -9,6 +9,10 @@ from functools import lru_cache
 import json
 from psycopg2 import pool
 import aiohttp
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -30,6 +34,28 @@ client = Client(os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN'))
 
 # Глобальный объект ClientSession
 global_session = None
+
+# Получение TimescaleDB connection string
+timescale_connection_string = os.getenv('TIMESCALE_CONNECTION_STRING')
+if not timescale_connection_string:
+    raise ValueError("TIMESCALE_CONNECTION_STRING не установлена")
+
+# Разбиение строки подключения на части
+timescale_connection_string = os.getenv('TIMESCALE_CONNECTION_STRING')
+if timescale_connection_string:
+    host, dbname, user, password = timescale_connection_string.split(':')
+
+    # Обновляем параметры пула соединений
+    connection_pool = pool.SimpleConnectionPool(
+        1,  # mincached
+        20,  # maxcached
+        host=host,
+        database=dbname.split('/')[0],
+        user=user.split('@')[0].split(':')[0],
+        password=user.split('@')[1].split(':')[0]
+    )
+else:
+    logging.warning("TIMESCALE_CONNECTION_STRING не установлена. Используется значение из переменных окружения.")
 
 
 class CompanySettings:
@@ -112,17 +138,6 @@ class SalesScript:
             with conn.cursor() as cur:
                 cur.execute(query, (json.dumps(self.steps),))
                 conn.commit()
-
-
-# Пул соединений с базой данных
-connection_pool = pool.SimpleConnectionPool(
-    1,  # mincached
-    20,  # maxcached
-    host=os.getenv('TIMESCALE_HOST'),
-    database=os.getenv('TIMESCALE_DB'),
-    user=os.getenv('TIMESCALE_USER'),
-    password=os.getenv('TIMESCALE_PASSWORD')
-)
 
 
 async def create_tables():
