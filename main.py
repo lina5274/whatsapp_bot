@@ -1,7 +1,6 @@
 import os
 import logging
-from twilio.rest import Client
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import openai
 from langdetect import detect, LangDetectException
 import asyncio
@@ -10,6 +9,7 @@ import json
 from psycopg2 import pool
 import aiohttp
 from dotenv import load_dotenv
+import requests
 
 # Загрузка переменных окружения из .env файла
 load_dotenv()
@@ -17,9 +17,9 @@ load_dotenv()
 # Настройка логирования
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Получение переменных окружения
-required_env_vars = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TIMESCALE_CONNECTION_STRING', 'OPENAI_API_KEY',
-                     'TWILIO_PHONE_NUMBER']
+required_env_vars = ['GREEN_API_URL', 'GREEN_ID_INSTANCE', 'GREEN_API_TOKEN_INSTANCE',
+                     'TIMESCALE_CONNECTION_STRING', 'OPENAI_API_KEY', 'GREEN_PHONE_NUMBER']
+
 
 missing_env_vars = [var for var in required_env_vars if not os.getenv(var)]
 if missing_env_vars:
@@ -30,32 +30,26 @@ openai.api_key = os.getenv('OPENAI_API_KEY')
 
 app = Flask(__name__)
 
-client = Client(os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN'))
+# Получение Green API клиента
+green_api_client = requests.Session()
+green_api_headers = {
+    "Authorization": f"Bearer {os.getenv('GREEN_API_TOKEN_INSTANCE')}",
+    "instanceId": os.getenv('GREEN_ID_INSTANCE')
+}
+
 
 # Глобальный объект ClientSession
 global_session = None
 
-# Получение TimescaleDB connection string
-timescale_connection_string = os.getenv('TIMESCALE_CONNECTION_STRING')
-if not timescale_connection_string:
-    raise ValueError("TIMESCALE_CONNECTION_STRING не установлена")
-
-# Разбиение строки подключения на части
-timescale_connection_string = os.getenv('TIMESCALE_CONNECTION_STRING')
-if timescale_connection_string:
-    host, dbname, user, password = timescale_connection_string.split(':')
-
-    # Обновляем параметры пула соединений
-    connection_pool = pool.SimpleConnectionPool(
-        1,  # mincached
-        20,  # maxcached
-        host=host,
-        database=dbname.split('/')[0],
-        user=user.split('@')[0].split(':')[0],
-        password=user.split('@')[1].split(':')[0]
-    )
-else:
-    logging.warning("TIMESCALE_CONNECTION_STRING не установлена. Используется значение из переменных окружения.")
+# Создание пула соединений с PostgreSQL
+connection_pool = pool.ThreadedConnectionPool(
+    1,  # minconn
+    20,  # maxconn
+    host=os.getenv('POSTGRESQL_HOST'),
+    database=os.getenv('POSTGRESQL_DB'),
+    user=os.getenv('POSTGRESQL_USER'),
+    password=os.getenv('POSTGRESQL_PASSWORD')
+)
 
 
 class CompanySettings:
@@ -147,11 +141,8 @@ async def create_tables():
         user_id TEXT,
         message_role TEXT,
         message_content TEXT,
-        timestamp TIMESTAMPTZ DEFAULT NOW()
+        timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
-    """
-    query_create_hypertable = """
-    SELECT create_hypertable('chat_history', 'timestamp');
     """
     query_create_users_table = """
     CREATE TABLE IF NOT EXISTS users (
@@ -161,11 +152,32 @@ async def create_tables():
         language TEXT DEFAULT 'en'
     );
     """
-
+    query_create_company_settings_table = """
+    CREATE TABLE IF NOT EXISTS company_settings (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        description TEXT,
+        contact_info JSONB,
+        price_list JSONB,
+        products JSONB
+    );
+    """
+    query_create_sales_script_table = """
+    CREATE TABLE IF NOT EXISTS sales_script (
+        id SERIAL PRIMARY KEY,
+        steps JSONB
+    );
+    """
+    query_add_index = """
+    CREATE INDEX IF NOT EXISTS idx_chat_history_user_id ON chat_history(user_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_history_timestamp ON chat_history(timestamp);
+    """
     execute_query(query_create_chat_history_table)
-    execute_query(query_create_hypertable)
     execute_query(query_create_users_table)
-
+    execute_query(query_create_company_settings_table)
+    execute_query(query_create_sales_script_table)
+    execute_query(query_add_index)
+    
 
 def execute_query(query, params=None, return_data=True):
     with connection_pool.getconn() as conn:
@@ -173,6 +185,32 @@ def execute_query(query, params=None, return_data=True):
             cur.execute(query, params)
             if return_data:
                 return cur.fetchall()
+
+
+async def send_message(to, body):
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = os.getenv('GREEN_API_URL')
+
+            payload = {
+                "from": os.getenv('GREEN_PHONE_NUMBER'),
+                "to": to,
+                "body": body
+            }
+
+            headers = {
+                "Authorization": f"Bearer {os.getenv('GREEN_API_TOKEN_INSTANCE')}",
+                "instanceId": os.getenv('GREEN_ID_INSTANCE')
+            }
+
+            async with session.post(url, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                data = await response.json()
+                return data['sid']
+
+    except Exception as e:
+        logging.error(f"Ошибка при отправке сообщения через Green API: {str(e)}")
+        raise Exception(f"Ошибка при отправке сообщения: {str(e)}")
 
 
 async def save_message(user_id, message_role, message_content):
@@ -281,7 +319,10 @@ def handle_whatsapp():
         # Сохранение ответа ИИ-помощи
         save_ai_response(whatsapp_id, ai_response)
 
-        return "OK"
+        # Отправка сообщения клиенту
+        message_sid = send_message(whatsapp_id, ai_response)
+
+        return jsonify({"message": "Сообщение успешно отправлено.", "sid": message_sid})
 
     except Exception as e:
         logging.error(f"Ошибка при обработке запроса WhatsApp: {str(e)}")
@@ -304,7 +345,9 @@ async def get_ai_response(whatsapp_id, message):
         "messages": [
             {
                 "role": "system",
-                "content": "Вы работаете как ассистент поддержки клиентов. Ваш ответ должен быть профессиальным, дружелюбным и соответствовать предпочтениям языка пользователя."
+                "content": "Вы работаете как ассистент поддержки клиентов."
+                           " Ваш ответ должен быть профессиальным, дружелюбным "
+                           "и соответствовать предпочтениям языка пользователя."
             },
             {
                 "role": "user",
